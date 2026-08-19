@@ -3,6 +3,12 @@
 Cast your desktop — with audio — to a Chromecast or any Google Cast device,
 straight from the Omarchy bar.
 
+![Cast panel](preview.png)
+
+```
+omarchy plugin add https://github.com/jakekeeys/omarchy-cast.git --enable
+```
+
 Unlike Miracast-based casting, this works with the Google Cast protocol that
 Chromecasts, Google TV, and Nest displays actually speak. Capture and encoding
 run on the GPU via `gpu-screen-recorder` (the same engine as Omarchy's screen

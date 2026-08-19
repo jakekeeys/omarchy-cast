@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "jakekeeys.cast",
+  "name": "Cast",
+  "version": "1.0.0",
+  "author": "jakekeeys",
+  "license": "MIT",
+  "description": "Cast your desktop and audio to a Chromecast from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Cast",
+    "description": "Cast the desktop with audio to a Google Cast device",
+    "category": "Streaming",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "lastDevice": "",
+      "fps": 30,
+      "resolution": "1920x1080",
+      "bitrate": 8000,
+      "port": 8089
+    },
+    "schema": [
+      {
+        "key": "fps",
+        "type": "integer",
+        "label": "Frame rate",
+        "min": 15,
+        "max": 60,
+        "step": 15,
+        "defaultValue": 30
+      },
+      {
+        "key": "resolution",
+        "type": "string",
+        "label": "Stream resolution",
+        "description": "Output resolution limit (WxH)",
+        "defaultValue": "1920x1080"
+      },
+      {
+        "key": "bitrate",
+        "type": "integer",
+        "label": "Bitrate (kbps)",
+        "min": 2000,
+        "max": 20000,
+        "step": 1000,
+        "defaultValue": 8000
+      },
+      {
+        "key": "port",
+        "type": "integer",
+        "label": "Stream port",
+        "description": "Local HTTP port the Chromecast pulls the stream from",
+        "min": 1024,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 8089
+      }
+    ]
+  }
+}

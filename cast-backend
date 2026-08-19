@@ -1,0 +1,334 @@
+#!/bin/bash
+# Backend for the jake.cast Omarchy bar widget.
+#
+#   cast-backend scan                          → JSON array of Google Cast devices
+#   cast-backend start <device> [opts]         → start casting (+ audio)
+#       --fps N --resolution WxH --bitrate N --port N
+#       --pick        pick an area/window/monitor with omarchy-capture-region
+#   cast-backend stop                          → stop casting
+#   cast-backend status                        → JSON {casting, device, since}
+#   cast-backend ensure-firewall [--port N]    → open the stream port once (pkexec)
+#   cast-backend remove-firewall               → close the stream port (pkexec)
+#   cast-backend teardown-if-disabled          → remove-firewall when the plugin
+#                                                is no longer in the bar layout
+#
+# Pipeline: gpu-screen-recorder (GPU capture + h264/aac encode, sudoless via
+# its own KMS helper) → ffmpeg (remux only, no re-encode) → live HLS served by
+# a minimal LAN-only HTTP server → catt tells the Chromecast to play it.
+# The server exists only while a cast is active; the Cast protocol pulls media
+# over HTTP, so a server is required.
+
+set -u
+
+PLUGIN_ID="jakekeeys.cast"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-cast"
+HLS_DIR="$RUNTIME/hls"
+STATE="$RUNTIME/state.json"
+STATE_DIR="$HOME/.local/state/omarchy-cast"
+FIREWALL_MARKER="$STATE_DIR/firewall-port"
+SHELL_JSON="$HOME/.config/omarchy/shell.json"
+GSR_LOG="$RUNTIME/gsr.log"
+FFMPEG_LOG="$RUNTIME/ffmpeg.log"
+UFW_COMMENT="jake-cast"
+PRIVATE_CIDRS=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+
+PORT=8089
+FPS=30
+RESOLUTION="1920x1080"
+BITRATE=8000
+PICK=false
+
+mkdir -p "$RUNTIME" "$STATE_DIR"
+
+# quickshell's PATH may not include ~/.local/bin where uv puts catt
+CATT="$(command -v catt || true)"
+[[ -z "$CATT" && -x "$HOME/.local/bin/catt" ]] && CATT="$HOME/.local/bin/catt"
+# absolute path on purpose: omarchy's recording indicator matches
+# `pgrep -f "^gpu-screen-recorder"`, which a bare invocation would trip
+GSR="$(command -v gpu-screen-recorder || true)"
+
+die() { echo "$1" >&2; exit 1; }
+
+require_tools() {
+  [[ -n "$CATT" ]] || die "catt is not installed (uv tool install catt)"
+  [[ -n "$GSR" ]] || die "gpu-screen-recorder is not installed"
+  command -v ffmpeg >/dev/null || die "ffmpeg is not installed"
+}
+
+parse_opts() {
+  ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fps)        FPS="$2"; shift 2 ;;
+      --resolution) RESOLUTION="$2"; shift 2 ;;
+      --bitrate)    BITRATE="$2"; shift 2 ;;
+      --port)       PORT="$2"; shift 2 ;;
+      --pick)       PICK=true; shift ;;
+      *)            ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+local_ip() {
+  ip route get 1.1.1.1 2>/dev/null | grep -oP '(?<=src )[0-9.]+' | head -1
+}
+
+read_state() { [[ -f "$STATE" ]] && cat "$STATE" || echo "{}"; }
+
+state_get() { read_state | python3 -c "import json,sys; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null; }
+
+pipeline_alive() {
+  local pgid
+  pgid=$(state_get pgid)
+  [[ -n "$pgid" ]] && kill -0 -- -"$pgid" 2>/dev/null
+}
+
+plugin_enabled() {
+  [[ -f "$SHELL_JSON" ]] || return 1
+  python3 -c "
+import json, sys
+try:
+    layout = json.load(open('$SHELL_JSON')).get('bar', {}).get('layout', {})
+except Exception:
+    sys.exit(1)
+for section in layout.values():
+    if isinstance(section, list) and any(isinstance(e, dict) and e.get('id') == '$PLUGIN_ID' for e in section):
+        sys.exit(0)
+sys.exit(1)
+"
+}
+
+# ----- firewall (omarchy sunshine pattern: persistent tagged rules) -----
+
+cmd_ensure_firewall() {
+  command -v ufw >/dev/null || return 0
+  if [[ -f "$FIREWALL_MARKER" ]]; then
+    local old_port
+    old_port=$(cat "$FIREWALL_MARKER")
+    [[ "$old_port" == "$PORT" ]] && return 0
+    # port setting changed: swap the rules
+    firewall_delete "$old_port" || return 1
+    rm -f "$FIREWALL_MARKER"
+  fi
+  local cmds=""
+  local cidr
+  for cidr in "${PRIVATE_CIDRS[@]}"; do
+    cmds+="ufw allow in proto tcp from $cidr to any port $PORT comment '$UFW_COMMENT' >/dev/null; "
+  done
+  if pkexec bash -c "$cmds"; then
+    echo "$PORT" > "$FIREWALL_MARKER"
+    echo "firewall rule added for port $PORT"
+  else
+    die "firewall setup was not authorized"
+  fi
+}
+
+firewall_delete() {
+  local port="$1"
+  local cmds=""
+  local cidr
+  for cidr in "${PRIVATE_CIDRS[@]}"; do
+    cmds+="ufw --force delete allow in proto tcp from $cidr to any port $port >/dev/null 2>&1; "
+  done
+  pkexec bash -c "${cmds}true"
+}
+
+cmd_remove_firewall() {
+  command -v ufw >/dev/null || return 0
+  [[ -f "$FIREWALL_MARKER" ]] || { echo "no firewall rule recorded"; return 0; }
+  local port
+  port=$(cat "$FIREWALL_MARKER")
+  if firewall_delete "$port"; then
+    rm -f "$FIREWALL_MARKER"
+    echo "firewall rule removed"
+  else
+    die "firewall removal was not authorized"
+  fi
+}
+
+cmd_teardown_if_disabled() {
+  plugin_enabled && exit 0
+  cmd_remove_firewall
+}
+
+# ----- casting -----
+
+cmd_scan() {
+  require_tools
+  "$CATT" scan 2>/dev/null | python3 -c '
+import sys, json, re
+devices = []
+for line in sys.stdin:
+    m = re.match(r"^(\d+\.\d+\.\d+\.\d+) - (.+?) - (.+)$", line.strip())
+    if m:
+        devices.append({"ip": m.group(1), "name": m.group(2), "model": m.group(3)})
+print(json.dumps(devices))
+'
+}
+
+# Maps omarchy-capture-region output to gpu-screen-recorder capture args.
+# Monitors get the resolution limit; regions keep their native size
+# (mirrors omarchy-capture-screenrecording).
+capture_args() {
+  local target="$1"
+  if [[ "$target" == monitor:* ]]; then
+    CAPTURE_ARGS=(-w "${target#monitor:}" -s "$RESOLUTION")
+  elif [[ "$target" =~ ^(-?[0-9]+),(-?[0-9]+)[[:space:]]([0-9]+)x([0-9]+)$ ]]; then
+    CAPTURE_ARGS=(-w region -region "${BASH_REMATCH[3]}x${BASH_REMATCH[4]}+${BASH_REMATCH[1]}+${BASH_REMATCH[2]}")
+  else
+    return 1
+  fi
+}
+
+cmd_start() {
+  require_tools
+  local device="${1:-}"
+  [[ -n "$device" ]] || die "usage: cast-backend start <device-name> [--pick]"
+
+  local target
+  if [[ "$PICK" == true ]]; then
+    target=$(omarchy-capture-region smart --match-monitor) || die "cancelled"
+  else
+    target="monitor:$(omarchy-hyprland-monitor-focused 2>/dev/null)"
+    [[ "$target" != "monitor:" ]] || die "could not determine focused monitor"
+  fi
+  capture_args "$target" || die "unrecognized capture target: $target"
+
+  cmd_ensure_firewall || exit 1
+  cmd_stop quiet
+
+  local ip
+  ip=$(local_ip)
+  [[ -n "$ip" ]] || die "could not determine local IP"
+
+  rm -rf "$HLS_DIR"
+  mkdir -p "$HLS_DIR"
+
+  # LAN HTTP server for the playlist + segments, threaded so the Chromecast
+  # can hold connections for the playlist and segments concurrently
+  setsid python3 -c "
+import http.server, socketserver, functools
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {
+        '.m3u8': 'application/vnd.apple.mpegurl',
+        '.ts': 'video/mp2t',
+        '': 'application/octet-stream',
+    }
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        super().end_headers()
+    def log_message(self, *args):
+        pass
+
+socketserver.ThreadingTCPServer.allow_reuse_address = True
+socketserver.ThreadingTCPServer.daemon_threads = True
+with socketserver.ThreadingTCPServer(('0.0.0.0', $PORT), functools.partial(Handler, directory='$HLS_DIR')) as s:
+    s.serve_forever()
+" >/dev/null 2>&1 &
+  local server_pid=$!
+
+  # capture + encode on the GPU, remux to 1s HLS segments; the 30s window
+  # (+30 kept past the playlist edge) lets a stalled TV rebuffer and rejoin
+  # instead of 404ing off the live edge
+  setsid bash -c "
+'$GSR' $(printf "%q " "${CAPTURE_ARGS[@]}") -f '$FPS' \
+  -k h264 -bm cbr -q '$BITRATE' -keyint 1 \
+  -a default_output -ac aac \
+  -c mkv 2>'$GSR_LOG' | \
+ffmpeg -y -i - -c:v copy -c:a copy -f hls \
+  -hls_time 1 -hls_list_size 30 -hls_delete_threshold 30 \
+  -hls_flags delete_segments+omit_endlist \
+  -hls_segment_filename '$HLS_DIR/seg%05d.ts' \
+  '$HLS_DIR/stream.m3u8' 2>'$FFMPEG_LOG'
+" &
+  local pipeline_pid=$!
+
+  # wait for the playlist to fill before pointing the Chromecast at it
+  local ready=0
+  for _ in $(seq 1 40); do
+    if [[ -f "$HLS_DIR/stream.m3u8" ]] && grep -q '\.ts' "$HLS_DIR/stream.m3u8"; then
+      ready=1
+      break
+    fi
+    kill -0 "$pipeline_pid" 2>/dev/null || break
+    sleep 0.5
+  done
+
+  if [[ "$ready" != 1 ]]; then
+    kill -- -"$pipeline_pid" 2>/dev/null
+    kill -- -"$server_pid" 2>/dev/null
+    die "capture pipeline failed to start (see $GSR_LOG)"
+  fi
+
+  local url="http://${ip}:${PORT}/stream.m3u8"
+  if ! "$CATT" -d "$device" cast --stream-type live -f "$url" >/dev/null 2>&1; then
+    kill -- -"$pipeline_pid" 2>/dev/null
+    kill -- -"$server_pid" 2>/dev/null
+    die "could not start playback on $device"
+  fi
+
+  DEVICE="$device" PGID="$pipeline_pid" SERVER_PGID="$server_pid" URL="$url" TARGET="$target" python3 -c "
+import json, os, time
+print(json.dumps({
+    'device': os.environ['DEVICE'],
+    'pgid': int(os.environ['PGID']),
+    'server_pgid': int(os.environ['SERVER_PGID']),
+    'since': time.time(),
+    'url': os.environ['URL'],
+    'target': os.environ['TARGET'],
+}))" > "$STATE"
+
+  echo "casting to $device"
+}
+
+cmd_stop() {
+  local quiet="${1:-}"
+  local pgid server_pgid device
+  pgid=$(state_get pgid)
+  server_pgid=$(state_get server_pgid)
+  device=$(state_get device)
+
+  [[ -n "$pgid" ]] && kill -- -"$pgid" 2>/dev/null
+  [[ -n "$server_pgid" ]] && kill -- -"$server_pgid" 2>/dev/null
+  # safety net for orphans from a stale state file
+  pkill -f "hls_segment_filename $HLS_DIR" 2>/dev/null
+  pkill -f "directory='$HLS_DIR'" 2>/dev/null
+
+  if [[ -n "$device" && -n "$CATT" ]]; then
+    "$CATT" -d "$device" stop >/dev/null 2>&1 &
+  fi
+
+  rm -f "$STATE"
+  rm -rf "$HLS_DIR"
+  [[ "$quiet" == "quiet" ]] || echo "stopped"
+}
+
+cmd_status() {
+  if pipeline_alive; then
+    read_state | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+print(json.dumps({'casting': True, 'device': s.get('device',''), 'since': s.get('since', 0), 'target': s.get('target','')}))"
+  else
+    [[ -f "$STATE" ]] && rm -f "$STATE"
+    echo '{"casting": false, "device": "", "since": 0, "target": ""}'
+  fi
+}
+
+CMD="${1:-}"
+shift || true
+parse_opts "$@"
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+case "$CMD" in
+  scan)                 cmd_scan ;;
+  start)                cmd_start "$@" ;;
+  stop)                 cmd_stop ;;
+  status)               cmd_status ;;
+  ensure-firewall)      cmd_ensure_firewall ;;
+  remove-firewall)      cmd_remove_firewall ;;
+  teardown-if-disabled) cmd_teardown_if_disabled ;;
+  *) die "usage: cast-backend scan|start <device> [--pick]|stop|status|ensure-firewall|remove-firewall|teardown-if-disabled" ;;
+esac
